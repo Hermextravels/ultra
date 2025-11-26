@@ -1,3 +1,45 @@
+#!/usr/bin/make -f
+# Simple Makefile for building GPU solvers
+# Usage:
+#   make filtered_solver CUDA_ARCH=sm_86
+#   make ultra_solver CUDA_ARCH=sm_86 ULTRA_SRC=ultra_optimized_kernel.cu
+#   make filtered_solver_fatbin
+#   make clean
+
+.PHONY: all clean
+
+CUDA_ARCH ?= sm_86
+NVCC ?= nvcc
+NVCC_FLAGS := -O3 --use_fast_math -Xptxas -O3,-v -arch=$(CUDA_ARCH)
+
+# Ultra kernel source can be overridden: make ultra_solver ULTRA_SRC=path/to/file.cu
+ULTRA_SRC ?= ultra_optimized_kernel.cu
+
+all: filtered_solver
+
+filtered_solver: filtered_search_kernel.cu smart_range_filter.cuh
+	$(NVCC) $(NVCC_FLAGS) filtered_search_kernel.cu -o $@
+
+# Fatbin build with multiple architectures
+filtered_solver_fatbin: filtered_search_kernel.cu smart_range_filter.cuh
+	$(NVCC) -O3 --use_fast_math -Xptxas -O3,-v \
+	  -gencode arch=compute_75,code=sm_75 \
+	  -gencode arch=compute_86,code=sm_86 \
+	  -gencode arch=compute_89,code=sm_89 \
+	  filtered_search_kernel.cu -o filtered_solver
+
+ultra_solver: $(ULTRA_SRC)
+	$(NVCC) $(NVCC_FLAGS) $(ULTRA_SRC) -o $@
+
+ultra_solver_fatbin: $(ULTRA_SRC)
+	$(NVCC) -O3 --use_fast_math -Xptxas -O3,-v \
+	  -gencode arch=compute_75,code=sm_75 \
+	  -gencode arch=compute_86,code=sm_86 \
+	  -gencode arch=compute_89,code=sm_89 \
+	  $(ULTRA_SRC) -o ultra_solver
+
+clean:
+	rm -f filtered_solver ultra_solver
 # Ultimate Bitcoin Puzzle Solver - Makefile
 
 # Compiler and flags

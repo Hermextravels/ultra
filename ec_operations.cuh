@@ -25,6 +25,19 @@ __constant__ uint256_t SECP256K1_Gy = {
      0x0E1108A8, 0x5DA4FBFC, 0x26A3C465, 0x483ADA77}
 };
 
+// Endomorphism constants
+// lambda used for scalar decomposition (not yet used here, added for future GLV split)
+__constant__ uint256_t SECP256K1_LAMBDA = {
+    {0xC05C30E0, 0x5363AD4C, 0x8812645A, 0xA5261C02,
+     0x20816678, 0x122E22EA, 0x1B23BD72, 0xDF02967C}
+};
+
+// beta used for the endomorphism psi: psi(x, y) = (beta * x mod p, y)
+__constant__ uint256_t SECP256K1_BETA = {
+    {0x657C0710, 0x7AE96A2B, 0xAC3434E9, 0x6E64479E,
+     0x12F58995, 0x9CF04975, 0x719501EE, 0xC1396C28}
+};
+
 // ================ MODULAR ARITHMETIC COMPLETE ================
 
 __device__ __forceinline__ int cmp256(const uint256_t &a, const uint256_t &b) {
