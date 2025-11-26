@@ -223,6 +223,8 @@ extern "C" __global__ void filtered_search_kernel(
     __shared__ unsigned long long chunk_start, chunk_count;
     unsigned long long local_generated=0ULL, local_filtered=0ULL, local_searched=0ULL;
 
+    bool independent_mode = (total_keys <= 0x1000000ULL); // use direct scalar mult for <=24-bit ranges for correctness
+
     for(;;){
         if (threadIdx.x==0){
             unsigned long long start = atomicAdd(next_chunk_ptr, chunk_size);
@@ -252,49 +254,83 @@ extern "C" __global__ void filtered_search_kernel(
         ECPoint P0; ec_mult_glv(P0, k, G);
         ECPointJ PJ; jacobian_from_affine(PJ, P0);
         int start_offset = 0;
-        if (P0.infinity) {
-            // Avoid processing infinity (key=0); advance once so first batch point is G (key=base+1)
-            jacobian_mixed_add(PJ, G);
-            start_offset = 1;
-        }
+        if (P0.infinity) { jacobian_mixed_add(PJ, G); start_offset = 1; }
         const int MAX_BATCH=16; int BATCH=batch_steps; if(BATCH<1)BATCH=8; if(BATCH>MAX_BATCH)BATCH=MAX_BATCH;
         unsigned long long processed=0ULL; uint64_t base_key[4]={my_key[0],my_key[1],my_key[2],my_key[3]};
 
         while (processed < my_count && !*result_found){
             int B = (int)((my_count - processed) < (unsigned long long)BATCH ? (my_count - processed) : (unsigned long long)BATCH);
-            uint256_t Xs[MAX_BATCH], Ys[MAX_BATCH], Zs[MAX_BATCH], invZ[MAX_BATCH];
-            for(int i=0;i<B;i++){ Xs[i]=PJ.X; Ys[i]=PJ.Y; Zs[i]=PJ.Z; local_generated++; jacobian_mixed_add(PJ, G); }
-            batch_invert_thread_fixed(invZ, Zs, B);
-            for(int i=0;i<B && !*result_found;i++){
-                bool do_hash=true;
-                if (use_filter){ uint64_t cand[4]; add_small_to_key(cand, base_key, (unsigned long long)(processed + i + start_offset)); do_hash=is_key_worth_searching(cand); if(!do_hash){ local_filtered++; continue; } else local_searched++; }
-                else local_searched++;
-                uint256_t invZ2, invZ3, x_aff, y_aff;
-                mod_mult_complete(invZ2, invZ[i], invZ[i], SECP256K1_P);
-                mod_mult_complete(invZ3, invZ2, invZ[i], SECP256K1_P);
-                mod_mult_complete(x_aff, Xs[i], invZ2, SECP256K1_P);
-                mod_mult_complete(y_aff, Ys[i], invZ3, SECP256K1_P);
-                // Serialize pubkey according to format
-                uint8_t sha[32], h160[20];
-                if (!use_uncompressed) {
-                    uint8_t pk[33]; pk[0]=(y_aff.v[0]&1)?0x03:0x02;
-                    for(int w=0;w<8;w++){ uint32_t word=x_aff.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
-                    sha256(sha, pk, 33); ripemd160(h160, sha, 32);
-                } else {
-                    uint8_t pk[65]; pk[0]=0x04;
-                    for(int w=0;w<8;w++){ uint32_t word=x_aff.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
-                    for(int w=0;w<8;w++){ uint32_t word=y_aff.v[7-w]; pk[33+w*4+0]=(word>>24)&0xFF; pk[33+w*4+1]=(word>>16)&0xFF; pk[33+w*4+2]=(word>>8)&0xFF; pk[33+w*4+3]=(word>>0)&0xFF; }
-                    sha256(sha, pk, 65); ripemd160(h160, sha, 32);
-                }
-                if (debug_enable && processed==0 && i==0) { for(int b=0;b<20;b++) debug_hash160[b]=h160[b]; }
-                bool matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
-                if(matched){ *result_found=1; uint64_t rk[4]; add_small_to_key(rk, base_key, (unsigned long long)(processed + i + start_offset)); result_key[0]=rk[0]; result_key[1]=rk[1]; result_key[2]=rk[2]; result_key[3]=rk[3]; break; }
-                if (use_psi && !use_uncompressed) {
-                    uint256_t psi_x; mod_mult_complete(psi_x, x_aff, SECP256K1_BETA, SECP256K1_P);
-                    uint8_t pk2[33]; pk2[0]=(y_aff.v[0]&1)?0x03:0x02; for(int w=0;w<8;w++){ uint32_t word=psi_x.v[7-w]; pk2[1+w*4+0]=(word>>24)&0xFF; pk2[1+w*4+1]=(word>>16)&0xFF; pk2[1+w*4+2]=(word>>8)&0xFF; pk2[1+w*4+3]=(word>>0)&0xFF; }
-                    sha256(sha, pk2, 33); ripemd160(h160, sha, 32); if (debug_enable && processed==0 && i==0) { for(int b=0;b<20;b++) debug_hash160[b]=h160[b]; } matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
+            if (!independent_mode) {
+                uint256_t Xs[MAX_BATCH], Ys[MAX_BATCH], Zs[MAX_BATCH], invZ[MAX_BATCH];
+                for(int i=0;i<B;i++){ Xs[i]=PJ.X; Ys[i]=PJ.Y; Zs[i]=PJ.Z; local_generated++; jacobian_mixed_add(PJ, G); }
+                batch_invert_thread_fixed(invZ, Zs, B);
+                for(int i=0;i<B && !*result_found;i++){
+                    bool do_hash=true;
+                    if (use_filter){ uint64_t cand[4]; add_small_to_key(cand, base_key, (unsigned long long)(processed + i + start_offset)); do_hash=is_key_worth_searching(cand); if(!do_hash){ local_filtered++; continue; } else local_searched++; }
+                    else local_searched++;
+                    uint256_t invZ2, invZ3, x_aff, y_aff;
+                    mod_mult_complete(invZ2, invZ[i], invZ[i], SECP256K1_P);
+                    mod_mult_complete(invZ3, invZ2, invZ[i], SECP256K1_P);
+                    mod_mult_complete(x_aff, Xs[i], invZ2, SECP256K1_P);
+                    mod_mult_complete(y_aff, Ys[i], invZ3, SECP256K1_P);
+                    uint8_t sha[32], h160[20];
+                    if (!use_uncompressed) {
+                        uint8_t pk[33]; pk[0]=(y_aff.v[0]&1)?0x03:0x02;
+                        for(int w=0;w<8;w++){ uint32_t word=x_aff.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
+                        sha256(sha, pk, 33); ripemd160(h160, sha, 32);
+                    } else {
+                        uint8_t pk[65]; pk[0]=0x04;
+                        for(int w=0;w<8;w++){ uint32_t word=x_aff.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
+                        for(int w=0;w<8;w++){ uint32_t word=y_aff.v[7-w]; pk[33+w*4+0]=(word>>24)&0xFF; pk[33+w*4+1]=(word>>16)&0xFF; pk[33+w*4+2]=(word>>8)&0xFF; pk[33+w*4+3]=(word>>0)&0xFF; }
+                        sha256(sha, pk, 65); ripemd160(h160, sha, 32);
+                    }
+                    if (debug_enable && processed==0 && i==0) { for(int b=0;b<20;b++) debug_hash160[b]=h160[b]; }
+                    bool matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
                     if(matched){ *result_found=1; uint64_t rk[4]; add_small_to_key(rk, base_key, (unsigned long long)(processed + i + start_offset)); result_key[0]=rk[0]; result_key[1]=rk[1]; result_key[2]=rk[2]; result_key[3]=rk[3]; break; }
+                    if (use_psi && !use_uncompressed) {
+                        uint256_t psi_x; mod_mult_complete(psi_x, x_aff, SECP256K1_BETA, SECP256K1_P);
+                        uint8_t pk2[33]; pk2[0]=(y_aff.v[0]&1)?0x03:0x02; for(int w=0;w<8;w++){ uint32_t word=psi_x.v[7-w]; pk2[1+w*4+0]=(word>>24)&0xFF; pk2[1+w*4+1]=(word>>16)&0xFF; pk2[1+w*4+2]=(word>>8)&0xFF; pk2[1+w*4+3]=(word>>0)&0xFF; }
+                        sha256(sha, pk2, 33); ripemd160(h160, sha, 32); if (debug_enable && processed==0 && i==0) { for(int b=0;b<20;b++) debug_hash160[b]=h160[b]; } matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
+                        if(matched){ *result_found=1; uint64_t rk[4]; add_small_to_key(rk, base_key, (unsigned long long)(processed + i + start_offset)); result_key[0]=rk[0]; result_key[1]=rk[1]; result_key[2]=rk[2]; result_key[3]=rk[3]; break; }
+                    }
                 }
+            } else {
+                // Independent scalar multiplication path for correctness
+                for(int i=0;i<B && !*result_found;i++){
+                    unsigned long long offset = processed + i + start_offset;
+                    uint64_t cand_key[4]; add_small_to_key(cand_key, base_key, offset);
+                    bool do_hash=true;
+                    if (use_filter){ do_hash=is_key_worth_searching(cand_key); if(!do_hash){ local_filtered++; continue; } else local_searched++; }
+                    else local_searched++;
+                    uint256_t scalar;
+                    scalar.v[0]=(uint32_t)(cand_key[0]&0xffffffffULL); scalar.v[1]=(uint32_t)(cand_key[0]>>32);
+                    scalar.v[2]=(uint32_t)(cand_key[1]&0xffffffffULL); scalar.v[3]=(uint32_t)(cand_key[1]>>32);
+                    scalar.v[4]=(uint32_t)(cand_key[2]&0xffffffffULL); scalar.v[5]=(uint32_t)(cand_key[2]>>32);
+                    scalar.v[6]=(uint32_t)(cand_key[3]&0xffffffffULL); scalar.v[7]=(uint32_t)(cand_key[3]>>32);
+                    ECPoint Q; ec_mult_glv(Q, scalar, G);
+                    uint8_t sha[32], h160[20];
+                    if (!use_uncompressed) {
+                        uint8_t pk[33]; pk[0]=(Q.y.v[0]&1)?0x03:0x02;
+                        for(int w=0;w<8;w++){ uint32_t word=Q.x.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
+                        sha256(sha, pk, 33); ripemd160(h160, sha, 32);
+                    } else {
+                        uint8_t pk[65]; pk[0]=0x04;
+                        for(int w=0;w<8;w++){ uint32_t word=Q.x.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
+                        for(int w=0;w<8;w++){ uint32_t word=Q.y.v[7-w]; pk[33+w*4+0]=(word>>24)&0xFF; pk[33+w*4+1]=(word>>16)&0xFF; pk[33+w*4+2]=(word>>8)&0xFF; pk[33+w*4+3]=(word>>0)&0xFF; }
+                        sha256(sha, pk, 65); ripemd160(h160, sha, 32);
+                    }
+                    if (debug_enable && processed==0 && i==0) { for(int b=0;b<20;b++) debug_hash160[b]=h160[b]; }
+                    bool matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
+                    if(matched){ *result_found=1; result_key[0]=cand_key[0]; result_key[1]=cand_key[1]; result_key[2]=cand_key[2]; result_key[3]=cand_key[3]; break; }
+                    if (use_psi && !use_uncompressed) {
+                        uint256_t psi_x; mod_mult_complete(psi_x, Q.x, SECP256K1_BETA, SECP256K1_P);
+                        uint8_t pk2[33]; pk2[0]=(Q.y.v[0]&1)?0x03:0x02; for(int w=0;w<8;w++){ uint32_t word=psi_x.v[7-w]; pk2[1+w*4+0]=(word>>24)&0xFF; pk2[1+w*4+1]=(word>>16)&0xFF; pk2[1+w*4+2]=(word>>8)&0xFF; pk2[1+w*4+3]=(word>>0)&0xFF; }
+                        sha256(sha, pk2, 33); ripemd160(h160, sha, 32); bool matched2=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched2=false; break; } }
+                        if(matched2){ *result_found=1; result_key[0]=cand_key[0]; result_key[1]=cand_key[1]; result_key[2]=cand_key[2]; result_key[3]=cand_key[3]; break; }
+                    }
+                }
+                processed += B;
+                continue;
             }
             processed += B;
         }
