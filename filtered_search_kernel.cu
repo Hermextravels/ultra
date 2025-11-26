@@ -4,12 +4,21 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <chrono>
 #include "smart_range_filter.cuh"
 
 // Minimal EC types for secp256k1 operations
 struct uint256_t { uint32_t v[8]; };
 struct ECPoint { uint256_t x; uint256_t y; bool infinity; };
 struct ECPointJ { uint256_t X; uint256_t Y; uint256_t Z; bool infinity; };
+
+// Precomputed window table (affine) for G: size depends on WINDOW_BITS (4 or 5)
+#ifndef WINDOW_BITS
+#define WINDOW_BITS 4
+#endif
+#define WINDOW_SIZE (1 << WINDOW_BITS)
+__device__ ECPoint G_TABLE[WINDOW_SIZE]; // populated by init kernel
+__device__ int G_TABLE_READY = 0;
 
 // Statistics structure
 struct FilterStats {
@@ -182,6 +191,35 @@ __device__ void ec_mult_simple(ECPoint &R, const uint256_t &k, const ECPoint &G)
     }
 }
 
+#define USE_WINDOWED_MULT 1
+__device__ void ec_mult_window4(ECPoint &R, const uint256_t &k, const ECPoint &G){
+    // Ensure table populated
+    if (!G_TABLE_READY) {
+        // Fallback: build a local table (should rarely execute if init kernel ran)
+        ECPoint table_local[WINDOW_SIZE];
+        table_local[0].infinity = true; table_local[1] = G;
+        for (int i=2;i<WINDOW_SIZE;i++){ ECPoint T; ec_add_complete(T, table_local[i-1], G); table_local[i]=T; }
+        R.infinity = true;
+        for(int nib=(256+WINDOW_BITS-1)/WINDOW_BITS -1; nib>=0; --nib){
+            if(!R.infinity){ for(int d=0; d<WINDOW_BITS; ++d){ ECPoint D; ec_double_complete(D, R); R=D; } }
+            int bit_index = nib*WINDOW_BITS; int word = bit_index/32; int offset = bit_index%32;
+            uint32_t chunk = k.v[word] >> offset; if(offset > (32-WINDOW_BITS) && word < 7){ chunk |= k.v[word+1] << (32-offset); }
+            int value = chunk & (WINDOW_SIZE-1);
+            if(value){ if(R.infinity){ R=table_local[value]; R.infinity=false; } else { ECPoint A; ec_add_complete(A, R, table_local[value]); R=A; } }
+        }
+        return;
+    }
+    // Use precomputed global table
+    R.infinity = true;
+    for(int nib=(256+WINDOW_BITS-1)/WINDOW_BITS -1; nib>=0; --nib){
+        if(!R.infinity){ for(int d=0; d<WINDOW_BITS; ++d){ ECPoint D; ec_double_complete(D, R); R=D; } }
+        int bit_index = nib*WINDOW_BITS; int word = bit_index/32; int offset = bit_index%32;
+        uint32_t chunk = k.v[word] >> offset; if(offset > (32-WINDOW_BITS) && word < 7){ chunk |= k.v[word+1] << (32-offset); }
+        int value = chunk & (WINDOW_SIZE-1);
+        if(value){ if(R.infinity){ R=G_TABLE[value]; R.infinity=false; } else { ECPoint A; ec_add_complete(A, R, G_TABLE[value]); R=A; } }
+    }
+}
+
 // GLV scalar decomposition: k = k1 + k2*lambda mod n
 __device__ void glv_decompose(uint256_t &k1, uint256_t &k2, bool &neg1, bool &neg2, const uint256_t &k) {
     // Approximation: split k using precomputed constants
@@ -196,7 +234,22 @@ __device__ void glv_decompose(uint256_t &k1, uint256_t &k2, bool &neg1, bool &ne
 __device__ void ec_mult_glv(ECPoint &R, const uint256_t &k, const ECPoint &G){
     // For now, fall back to simple multiply
     // Full GLV needs: decompose k, compute Q=psi(G), then k1*G + k2*Q
+    #ifdef USE_WINDOWED_MULT
+    ec_mult_window4(R, k, G);
+    #else
     ec_mult_simple(R, k, G);
+    #endif
+}
+
+// Initialization kernel to build G_TABLE
+extern "C" __global__ void init_g_table_kernel(){
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    ECPoint G; G.x = SECP256K1_Gx; G.y = SECP256K1_Gy; G.infinity=false;
+    G_TABLE[0].infinity = true;
+    G_TABLE[1] = G;
+    for(int i=2;i<WINDOW_SIZE;i++){ ECPoint T; ec_add_complete(T, G_TABLE[i-1], G); G_TABLE[i] = T; }
+    __threadfence();
+    G_TABLE_READY = 1;
 }
 
 // ----------------- Kernel -----------------
@@ -385,6 +438,14 @@ void launch_filtered_search(
 
     uint64_t chunk_size = (chunk_size_cli > 0) ? chunk_size_cli : (1024ULL * 1024ULL);
 
+    auto t0 = std::chrono::high_resolution_clock::now();
+    // Initialize precomputed table once (cheap)
+    static bool did_init = false;
+    if (!did_init) {
+        init_g_table_kernel<<<1,1>>>();
+        cudaDeviceSynchronize();
+        did_init = true;
+    }
     filtered_search_kernel<<<num_blocks, threads_per_block>>>(
         d_target,
         (uint64_t*)d_start_key,
@@ -423,6 +484,8 @@ void launch_filtered_search(
     cudaMemcpy(&stats, d_stats, sizeof(FilterStats), cudaMemcpyDeviceToHost);
     if (debug_enable) cudaMemcpy(dbg, d_debug_hash, 20, cudaMemcpyDeviceToHost);
 
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double elapsed = std::chrono::duration<double>(t1 - t0).count();
     printf("\n=== Filtering Statistics ===\n");
     printf("Total keys generated: %" PRIu64 "\n", (uint64_t)stats.total_keys_generated);
     if (stats.total_keys_generated > 0) {
@@ -437,6 +500,11 @@ void launch_filtered_search(
         printf("Effective speedup: %.2fx\n", eff);
     } else {
         printf("Effective speedup: 1.00x\n");
+    }
+    if (elapsed > 0.0 && stats.total_keys_generated > 0){
+        double mkeys = (double)stats.total_keys_generated / 1e6;
+        double rate = mkeys / elapsed;
+        printf("Elapsed: %.3f s, Rate: %.2f MKeys/s\n", elapsed, rate);
     }
 
     if (result_found) {
