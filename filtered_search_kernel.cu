@@ -208,6 +208,7 @@ extern "C" __global__ void filtered_search_kernel(
     int batch_steps,
     int use_filter,
     int use_psi,
+    int use_uncompressed,
     volatile uint8_t* __restrict__ result_found,
     uint64_t* __restrict__ result_key,
     FilterStats* __restrict__ stats,
@@ -265,14 +266,23 @@ extern "C" __global__ void filtered_search_kernel(
                 mod_mult_complete(invZ3, invZ2, invZ[i], SECP256K1_P);
                 mod_mult_complete(x_aff, Xs[i], invZ2, SECP256K1_P);
                 mod_mult_complete(y_aff, Ys[i], invZ3, SECP256K1_P);
-                uint8_t pk[33]; pk[0]=(y_aff.v[0]&1)?0x03:0x02;
-                for(int w=0;w<8;w++){ uint32_t word=x_aff.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
-                uint8_t sha[32], h160[20]; sha256(sha, pk, 33); ripemd160(h160, sha, 32);
+                // Serialize pubkey according to format
+                uint8_t sha[32], h160[20];
+                if (!use_uncompressed) {
+                    uint8_t pk[33]; pk[0]=(y_aff.v[0]&1)?0x03:0x02;
+                    for(int w=0;w<8;w++){ uint32_t word=x_aff.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
+                    sha256(sha, pk, 33); ripemd160(h160, sha, 32);
+                } else {
+                    uint8_t pk[65]; pk[0]=0x04;
+                    for(int w=0;w<8;w++){ uint32_t word=x_aff.v[7-w]; pk[1+w*4+0]=(word>>24)&0xFF; pk[1+w*4+1]=(word>>16)&0xFF; pk[1+w*4+2]=(word>>8)&0xFF; pk[1+w*4+3]=(word>>0)&0xFF; }
+                    for(int w=0;w<8;w++){ uint32_t word=y_aff.v[7-w]; pk[33+w*4+0]=(word>>24)&0xFF; pk[33+w*4+1]=(word>>16)&0xFF; pk[33+w*4+2]=(word>>8)&0xFF; pk[33+w*4+3]=(word>>0)&0xFF; }
+                    sha256(sha, pk, 65); ripemd160(h160, sha, 32);
+                }
                 bool matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
                 if(matched){ *result_found=1; uint64_t rk[4]; add_small_to_key(rk, base_key, (unsigned long long)(processed+i)); result_key[0]=rk[0]; result_key[1]=rk[1]; result_key[2]=rk[2]; result_key[3]=rk[3]; break; }
-                if (use_psi) {
+                if (use_psi && !use_uncompressed) {
                     uint256_t psi_x; mod_mult_complete(psi_x, x_aff, SECP256K1_BETA, SECP256K1_P);
-                    uint8_t pk2[33]; pk2[0]=pk[0]; for(int w=0;w<8;w++){ uint32_t word=psi_x.v[7-w]; pk2[1+w*4+0]=(word>>24)&0xFF; pk2[1+w*4+1]=(word>>16)&0xFF; pk2[1+w*4+2]=(word>>8)&0xFF; pk2[1+w*4+3]=(word>>0)&0xFF; }
+                    uint8_t pk2[33]; pk2[0]=(y_aff.v[0]&1)?0x03:0x02; for(int w=0;w<8;w++){ uint32_t word=psi_x.v[7-w]; pk2[1+w*4+0]=(word>>24)&0xFF; pk2[1+w*4+1]=(word>>16)&0xFF; pk2[1+w*4+2]=(word>>8)&0xFF; pk2[1+w*4+3]=(word>>0)&0xFF; }
                     sha256(sha, pk2, 33); ripemd160(h160, sha, 32); matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
                     if(matched){ *result_found=1; uint64_t rk[4]; add_small_to_key(rk, base_key, (unsigned long long)(processed+i)); result_key[0]=rk[0]; result_key[1]=rk[1]; result_key[2]=rk[2]; result_key[3]=rk[3]; break; }
                 }
@@ -296,6 +306,7 @@ void launch_filtered_search(
     int threads_per_block,
     int use_filter,
     int use_psi,
+    int use_uncompressed,
     uint64_t chunk_size_cli,
     int batch_steps
 ) {
@@ -329,6 +340,7 @@ void launch_filtered_search(
         batch_steps,
         use_filter,
         use_psi,
+        use_uncompressed,
         d_result_found,
         d_result_key,
         d_stats,
@@ -407,6 +419,7 @@ int main(int argc, char **argv) {
     uint64_t chunk_size = 1024ULL * 1024ULL;
     int use_filter = 0;
     int use_psi = 1;
+    int use_uncompressed = 0;
     int batch_steps = 8;
     uint64_t start_key[4] = { 0ULL, 0ULL, 0ULL, 0x0000000020000000ULL };
     uint8_t target_hash160[20] = { 0 };
@@ -414,7 +427,7 @@ int main(int argc, char **argv) {
     auto show_help = [](){
         printf("Usage: filtered_solver [--blocks N] [--threads N] [--total-keys N|N[KMG]]\n");
         printf("                      [--target-hash160 HEX40] [--start-key HEX64] [--chunk-size N|N[KMG]]\n");
-        printf("                      [--mode auto|filter|nofilter] [--batch-steps N<=16] [--no-psi]\n");
+        printf("                      [--mode auto|filter|nofilter] [--batch-steps N<=16] [--no-psi] [--pubkey-format compressed|uncompressed]\n");
     };
 
     for (int i = 1; i < argc; i++) {
@@ -427,6 +440,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--mode") && i+1 < argc) { const char* m = argv[++i]; if (!strcmp(m, "filter")) use_filter=1; else if(!strcmp(m, "nofilter")) use_filter=0; else use_filter=0; }
         else if (!strcmp(a, "--batch-steps") && i+1 < argc) { batch_steps = (int)strtoul(argv[++i], NULL, 10); if (batch_steps < 1) batch_steps = 1; if (batch_steps > 16) batch_steps = 16; }
         else if (!strcmp(a, "--no-psi")) { use_psi = 0; }
+        else if (!strcmp(a, "--pubkey-format") && i+1 < argc) { const char* f = argv[++i]; if (!strcmp(f, "uncompressed")) use_uncompressed = 1; else use_uncompressed = 0; }
         else if (!strcmp(a, "--target-hash160") && i+1 < argc) {
             const char* hex = argv[++i]; size_t len = strlen(hex);
             if (len == 40) { int ok=1; for (size_t j=0;j<40;j++) if(!is_hex(hex[j])){ ok=0; break; } if (ok) { for(int j=0;j<20;j++) target_hash160[j] = hex_to_byte(hex[2*j], hex[2*j+1]); } }
@@ -461,8 +475,8 @@ int main(int argc, char **argv) {
     // Launch search
     uint64_t total_threads = (uint64_t)num_blocks * (uint64_t)threads_per_block;
     printf("Grid: %d blocks x %d threads (total %" PRIu64 ")\n", num_blocks, threads_per_block, total_threads);
-        printf("Total keys: %" PRIu64 ", chunk-size: %" PRIu64 ", batch-steps: %d, mode: %s, psi: %s\n",
-            total_keys, chunk_size, batch_steps, use_filter ? "filter" : "nofilter", use_psi ? "on" : "off");
+        printf("Total keys: %" PRIu64 ", chunk-size: %" PRIu64 ", batch-steps: %d, mode: %s, psi: %s, format: %s\n",
+            total_keys, chunk_size, batch_steps, use_filter ? "filter" : "nofilter", use_psi ? "on" : "off", use_uncompressed?"uncompressed":"compressed");
 
     launch_filtered_search(
         target_hash160,
@@ -472,6 +486,7 @@ int main(int argc, char **argv) {
         threads_per_block,
         use_filter,
         use_psi,
+        use_uncompressed,
         chunk_size,
         batch_steps
     );
