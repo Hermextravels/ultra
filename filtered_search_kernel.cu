@@ -446,20 +446,28 @@ int main(int argc, char **argv) {
             if (len == 40) { int ok=1; for (size_t j=0;j<40;j++) if(!is_hex(hex[j])){ ok=0; break; } if (ok) { for(int j=0;j<20;j++) target_hash160[j] = hex_to_byte(hex[2*j], hex[2*j+1]); } }
         } else if (!strcmp(a, "--start-key") && i+1 < argc) {
             const char* hex = argv[++i]; size_t len = strlen(hex);
-            if (len == 64) {
-                int ok=1; for(size_t j=0;j<64;j++) if(!is_hex(hex[j])){ ok=0; break; }
-                if (ok) {
-                    uint8_t bytes[32]; for (int j = 0; j < 32; j++) bytes[j] = hex_to_byte(hex[2*j], hex[2*j+1]);
-                    auto load_be64 = [](const uint8_t* p)->uint64_t { return ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|((uint64_t)p[2]<<40)|((uint64_t)p[3]<<32)|((uint64_t)p[4]<<24)|((uint64_t)p[5]<<16)|((uint64_t)p[6]<<8)|((uint64_t)p[7]); };
-                    start_key[3] = load_be64(&bytes[0]);
-                    start_key[2] = load_be64(&bytes[8]);
-                    start_key[1] = load_be64(&bytes[16]);
-                    start_key[0] = load_be64(&bytes[24]);
-                } else {
-                    fprintf(stderr, "Invalid hex in --start-key, using default.\n");
-                }
+            // Support optional 0x prefix and shorter lengths by left-padding with zeros
+            if (len >= 2 && (hex[0]=='0') && (hex[1]=='x' || hex[1]=='X')) { hex += 2; len -= 2; }
+            if (len > 64) {
+                fprintf(stderr, "--start-key longer than 64 hex chars (got %zu). Using first 64.\n", len);
+                len = 64;
+            }
+            int ok = 1;
+            for (size_t j = 0; j < len; j++) { if (!is_hex(hex[j])) { ok = 0; break; } }
+            if (!ok) {
+                fprintf(stderr, "Invalid hex in --start-key, using default.\n");
             } else {
-                fprintf(stderr, "--start-key requires 64 hex chars, got %zu. Using default.\n", len);
+                char padded[65]; padded[64] = '\0';
+                size_t pad = 64 - len;
+                for (size_t j = 0; j < pad; j++) padded[j] = '0';
+                for (size_t j = 0; j < len; j++) padded[pad + j] = hex[j];
+                uint8_t bytes[32];
+                for (int j = 0; j < 32; j++) bytes[j] = hex_to_byte(padded[2*j], padded[2*j+1]);
+                auto load_be64 = [](const uint8_t* p)->uint64_t { return ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|((uint64_t)p[2]<<40)|((uint64_t)p[3]<<32)|((uint64_t)p[4]<<24)|((uint64_t)p[5]<<16)|((uint64_t)p[6]<<8)|((uint64_t)p[7]); };
+                start_key[3] = load_be64(&bytes[0]);
+                start_key[2] = load_be64(&bytes[8]);
+                start_key[1] = load_be64(&bytes[16]);
+                start_key[0] = load_be64(&bytes[24]);
             }
         }
     }
