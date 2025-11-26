@@ -212,7 +212,9 @@ extern "C" __global__ void filtered_search_kernel(
     volatile uint8_t* __restrict__ result_found,
     uint64_t* __restrict__ result_key,
     FilterStats* __restrict__ stats,
-    unsigned long long* __restrict__ next_chunk_ptr
+    unsigned long long* __restrict__ next_chunk_ptr,
+    uint8_t* __restrict__ debug_hash160,
+    int debug_enable
 ){
 
     // Predefine G
@@ -278,12 +280,13 @@ extern "C" __global__ void filtered_search_kernel(
                     for(int w=0;w<8;w++){ uint32_t word=y_aff.v[7-w]; pk[33+w*4+0]=(word>>24)&0xFF; pk[33+w*4+1]=(word>>16)&0xFF; pk[33+w*4+2]=(word>>8)&0xFF; pk[33+w*4+3]=(word>>0)&0xFF; }
                     sha256(sha, pk, 65); ripemd160(h160, sha, 32);
                 }
+                if (debug_enable && processed==0 && i==0) { for(int b=0;b<20;b++) debug_hash160[b]=h160[b]; }
                 bool matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
                 if(matched){ *result_found=1; uint64_t rk[4]; add_small_to_key(rk, base_key, (unsigned long long)(processed+i)); result_key[0]=rk[0]; result_key[1]=rk[1]; result_key[2]=rk[2]; result_key[3]=rk[3]; break; }
                 if (use_psi && !use_uncompressed) {
                     uint256_t psi_x; mod_mult_complete(psi_x, x_aff, SECP256K1_BETA, SECP256K1_P);
                     uint8_t pk2[33]; pk2[0]=(y_aff.v[0]&1)?0x03:0x02; for(int w=0;w<8;w++){ uint32_t word=psi_x.v[7-w]; pk2[1+w*4+0]=(word>>24)&0xFF; pk2[1+w*4+1]=(word>>16)&0xFF; pk2[1+w*4+2]=(word>>8)&0xFF; pk2[1+w*4+3]=(word>>0)&0xFF; }
-                    sha256(sha, pk2, 33); ripemd160(h160, sha, 32); matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
+                    sha256(sha, pk2, 33); ripemd160(h160, sha, 32); if (debug_enable && processed==0 && i==0) { for(int b=0;b<20;b++) debug_hash160[b]=h160[b]; } matched=true; for(int b=0;b<20;b++){ if(h160[b]!=target_hash160[b]){ matched=false; break; } }
                     if(matched){ *result_found=1; uint64_t rk[4]; add_small_to_key(rk, base_key, (unsigned long long)(processed+i)); result_key[0]=rk[0]; result_key[1]=rk[1]; result_key[2]=rk[2]; result_key[3]=rk[3]; break; }
                 }
             }
@@ -308,10 +311,11 @@ void launch_filtered_search(
     int use_psi,
     int use_uncompressed,
     uint64_t chunk_size_cli,
-    int batch_steps
+    int batch_steps,
+    int debug_enable
 ) {
     // Allocate device memory
-    uint8_t *d_target, *d_result_found;
+    uint8_t *d_target, *d_result_found, *d_debug_hash;
     uint64_t *d_start_key, *d_result_key;
     FilterStats *d_stats;
     unsigned long long *d_next_chunk;
@@ -322,6 +326,7 @@ void launch_filtered_search(
     cudaMalloc(&d_start_key, 32);
     cudaMalloc(&d_stats, sizeof(FilterStats));
     cudaMalloc(&d_next_chunk, sizeof(unsigned long long));
+    cudaMalloc(&d_debug_hash, 20);
 
     cudaMemcpy(d_target, target_hash160, 20, cudaMemcpyHostToDevice);
     cudaMemcpy(d_start_key, start_key, 32, cudaMemcpyHostToDevice);
@@ -329,6 +334,7 @@ void launch_filtered_search(
     cudaMemset(d_result_found, 0, 1);
     cudaMemset(d_stats, 0, sizeof(FilterStats));
     cudaMemset(d_next_chunk, 0, sizeof(unsigned long long));
+    if (debug_enable) cudaMemset(d_debug_hash, 0, 20);
 
     uint64_t chunk_size = (chunk_size_cli > 0) ? chunk_size_cli : (1024ULL * 1024ULL);
 
@@ -344,7 +350,9 @@ void launch_filtered_search(
         d_result_found,
         d_result_key,
         d_stats,
-        d_next_chunk
+        d_next_chunk,
+        d_debug_hash,
+        debug_enable
     );
 
     cudaError_t err = cudaGetLastError();
@@ -359,10 +367,12 @@ void launch_filtered_search(
     uint8_t result_found;
     uint64_t result_key[4];
     FilterStats stats;
+    uint8_t dbg[20];
 
     cudaMemcpy(&result_found, d_result_found, 1, cudaMemcpyDeviceToHost);
     cudaMemcpy(result_key, d_result_key, 32, cudaMemcpyDeviceToHost);
     cudaMemcpy(&stats, d_stats, sizeof(FilterStats), cudaMemcpyDeviceToHost);
+    if (debug_enable) cudaMemcpy(dbg, d_debug_hash, 20, cudaMemcpyDeviceToHost);
 
     printf("\n=== Filtering Statistics ===\n");
     printf("Total keys generated: %" PRIu64 "\n", (uint64_t)stats.total_keys_generated);
@@ -384,6 +394,17 @@ void launch_filtered_search(
          printf("\n🎉 KEY FOUND!\n");
          printf("Private key: %016" PRIx64 "%016" PRIx64 "%016" PRIx64 "%016" PRIx64 "\n",
              (uint64_t)result_key[3], (uint64_t)result_key[2], (uint64_t)result_key[1], (uint64_t)result_key[0]);
+    } else if (total_keys == 1) {
+         // CPU sanity: compute compressed pubkey hash160 for start_key and report
+         // Note: lightweight host-side secp256k1 implementation not available; we can only echo parsed key.
+         printf("\nNo match for single-key run. Parsed start key: %016" PRIx64 "%016" PRIx64 "%016" PRIx64 "%016" PRIx64 "\n",
+             (uint64_t)start_key[3], (uint64_t)start_key[2], (uint64_t)start_key[1], (uint64_t)start_key[0]);
+         if (debug_enable) {
+             printf("GPU-computed first hash160: ");
+             for (int i=0;i<20;i++) printf("%02x", dbg[i]);
+             printf("\n");
+         }
+         printf("If this should match, verify pubkey format (compressed), endianness, and parser padding.\n");
     }
 
     cudaFree(d_target);
@@ -392,6 +413,7 @@ void launch_filtered_search(
     cudaFree(d_start_key);
     cudaFree(d_stats);
     cudaFree(d_next_chunk);
+    cudaFree(d_debug_hash);
 }
 
 // ----------------- CLI Main -----------------
@@ -486,6 +508,8 @@ int main(int argc, char **argv) {
         printf("Total keys: %" PRIu64 ", chunk-size: %" PRIu64 ", batch-steps: %d, mode: %s, psi: %s, format: %s\n",
             total_keys, chunk_size, batch_steps, use_filter ? "filter" : "nofilter", use_psi ? "on" : "off", use_uncompressed?"uncompressed":"compressed");
 
+    int debug_enable_cli = 0; for (int i = 1; i < argc; i++) { if (!strcmp(argv[i], "--debug-hash")) { debug_enable_cli = 1; break; } }
+
     launch_filtered_search(
         target_hash160,
         start_key,
@@ -496,7 +520,8 @@ int main(int argc, char **argv) {
         use_psi,
         use_uncompressed,
         chunk_size,
-        batch_steps
+        batch_steps,
+        debug_enable_cli
     );
 
     return 0;
