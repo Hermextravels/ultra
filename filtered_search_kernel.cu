@@ -11,6 +11,13 @@ struct uint256_t { uint32_t v[8]; };
 struct ECPoint { uint256_t x; uint256_t y; bool infinity; };
 struct ECPointJ { uint256_t X; uint256_t Y; uint256_t Z; bool infinity; };
 
+// Statistics structure
+struct FilterStats {
+    unsigned long long total_keys_generated;
+    unsigned long long keys_filtered;
+    unsigned long long keys_searched;
+};
+
 // Bring in (simple) EC ops
 #include "ec_operations.cuh"
 
